@@ -1,0 +1,158 @@
+1. Introduction
+As more organizations move towards containers and virtual servers, Docker is becoming a more significant part of software development workflows. To that end, one of the great new features in Spring Boot 2.3 is the ability to create a Docker image for Spring Boot applications easily.
+In this tutorial, we'll look at how to create Docker images for a Spring Boot application.
+
+2. Traditional Docker Builds
+The traditional way of building Docker images with Spring Boot is to use a Dockerfile.
+
+FROM openjdk:8-jdk-alpine
+EXPOSE 8080
+ARG JAR_FILE=target/demo-app-1.0.0.jar
+ADD ${JAR_FILE} app.jar
+ENTRYPOINT ["java","-jar","/app.jar"]
+
+We could then use the docker build command to create a Docker image. This works fine for most applications, but there are a couple of drawbacks.
+First, we are using the fat jar created by Spring Boot. This can impact startup time, especially in a containerized environment. We can save startup time by adding the exploded contents of the jar file instead.
+Second, Docker images are built in layers. The nature of Spring Boot fat jars causes all application code and 3rd party libraries to be put into a single layer. This means even when only a single line of code changes, the entire layer has to be rebuilt.
+By exploding the jar before building, application code and 3rd party libraries each get their own layer. This allows us to take advantage of Docker's caching mechanism. Now, when one line of code is changed, only that corresponding layer needs to be rebuilt.
+With this in mind, let's look at how Spring Boot has improved the process of creating Docker images.
+
+3. Buildpacks
+Buildpacks are a tool that provides framework and application dependencies.
+For example, given a Spring Boot fat jar, a buildpack would provide the Java runtime for us. This allows us to skip the Dockerfile and get a sensible Docker image automatically.
+Spring Boot includes both Maven and Gradle support for buildpacks. For example, building with Maven, we would run the command:
+
+./mvnw spring-boot:build-image
+
+Let's look at some of the pertinent output to see what is happening:
+
+[INFO] Building jar: target/demo-0.0.1-SNAPSHOT.jar
+...
+[INFO] Building image 'docker.io/library/demo:0.0.1-SNAPSHOT'
+...
+[INFO]  > Pulling builder image 'gcr.io/paketo-buildpacks/builder:base-platform-api-0.3' 100%
+...
+[INFO]     [creator]     ===> DETECTING
+[INFO]     [creator]     5 of 15 buildpacks participating
+[INFO]     [creator]     paketo-buildpacks/bellsoft-liberica 2.8.1
+[INFO]     [creator]     paketo-buildpacks/executable-jar    1.2.8
+[INFO]     [creator]     paketo-buildpacks/apache-tomcat     1.3.1
+[INFO]     [creator]     paketo-buildpacks/dist-zip          1.3.6
+[INFO]     [creator]     paketo-buildpacks/spring-boot       1.9.1
+...
+[INFO] Successfully built image 'docker.io/library/demo:0.0.1-SNAPSHOT'
+[INFO] Total time:  44.796 s
+
+The first line shows we built our standard fat jar, just like any typical maven package.
+The next line begins the Docker image build. Right after, we see the build pulls in the Packeto builder.
+Packeto is an implementation of cloud-native buildpacks. It does the work of analyzing our project and determining the required frameworks and libraries. In our case, it determines that we have a Spring Boot project and adds in the required buildpacks.
+Finally, we see the generated Docker image and total build time. Notice how the first time we build, we spend a fair amount of time downloading buildpacks and creating different layers.
+One of the great features of buildpacks is that the Docker image is multiple layers. So if we only change our application code, subsequent builds will be much faster:
+
+...
+[INFO]     [creator]     Reusing layer 'paketo-buildpacks/executable-jar:class-path'
+[INFO]     [creator]     Reusing layer 'paketo-buildpacks/spring-boot:web-application-type'
+...
+[INFO] Successfully built image 'docker.io/library/demo:0.0.1-SNAPSHOT'
+...
+[INFO] Total time:  10.591 s
+
+4. Layered Jars
+In some cases, we may prefer not to use buildpacks — perhaps our infrastructure is already tied to another tool, or we already have custom Dockerfiles we want to re-use.
+For these reasons, Spring Boot also supports building Docker images using layered jars. To understand how it works, let's look at a typical Spring Boot fat jar layout:
+
+org/
+  springframework/
+    boot/
+  loader/
+...
+BOOT-INF/
+  classes/
+...
+lib/
+...
+
+The fat jar is composed of 3 main areas:
+- Bootstrap classes required to launch the Spring application
+- Application code
+- 3rd party libraries
+With layered jars, the structure looks similar, but we get a new layers.idx file that maps each directory in the fat jar to a layer:
+
+- "dependencies":
+  - "BOOT-INF/lib/"
+- "spring-boot-loader":
+  - "org/"
+- "snapshot-dependencies":
+- "application":
+  - "BOOT-INF/classes/"
+  - "BOOT-INF/classpath.idx"
+  - "BOOT-INF/layers.idx"
+  - "META-INF/"
+
+Out-of-the-box, Spring Boot provides four layers:
+- dependencies: typical dependencies from third parties
+- snapshot-dependencies: snapshot dependencies from 3rd parties
+- resources: static resources
+- application: application code and resources
+The goal is to place application code and third-party libraries into layers that reflect how often they change.
+For example, application code is likely what changes most frequently, so it gets its own layer. Further, each layer can evolve on its own, and only when a layer has changed will it be rebuilt for the Docker image.
+Now that we understand the new layered jar structure, let's look at how we can utilize it to make Docker images.
+
+4.1. Creating Layered Jars
+First, we have to set up our project to create a layered jar. With Maven, this means adding a new configuration to the Spring Boot plugin section of our POM:
+
+<plugin>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-maven-plugin</artifactId>
+    <configuration>
+        <layers>
+            <enabled>true</enabled>
+        </layers>
+    </configuration>
+</plugin>
+
+With this configuration, the Maven package command (along with any of its dependent commands) will generate a new layered jar using the four default layers mentioned previously.
+
+4.2. Viewing and Extracting Layers
+Next, we need to extract the layers from the jar so that the Docker image will have the proper layers.
+To examine the layers of any layered jar, we can run the command:
+
+java -Djarmode=layertools -jar demo-0.0.1.jar list
+
+Then to extract them, we would run:
+
+java -Djarmode=layertools -jar demo-0.0.1.jar extract
+
+4.3. Creating the Docker Image
+The easiest way to incorporate these layers into a Docker image is by using a Dockerfile:
+
+FROM adoptopenjdk:11-jre-hotspot as builder
+ARG JAR_FILE=target/*.jar
+COPY ${JAR_FILE} application.jar
+RUN java -Djarmode=layertools -jar application.jar extract
+
+FROM adoptopenjdk:11-jre-hotspot
+COPY --from=builder dependencies/ ./
+COPY --from=builder snapshot-dependencies/ ./
+COPY --from=builder spring-boot-loader/ ./
+COPY --from=builder application/ ./
+ENTRYPOINT ["java", "org.springframework.boot.loader.JarLauncher"]
+
+This Dockerfile extracts the layers from our fat jar, then copies each layer into the Docker image. Each COPY directive results in a new layer in the final Docker image.
+If we build this Dockerfile, we can see each layer from the layered jar get added to the Docker image as its own layer:
+
+...
+Step 6/10 : COPY --from=builder dependencies/ ./
+ ---> 2c631b8f9993
+Step 7/10 : COPY --from=builder snapshot-dependencies/ ./
+ ---> 26e8ceb86b7d
+Step 8/10 : COPY --from=builder spring-boot-loader/ ./
+ ---> 6dd9eaddad7f
+Step 9/10 : COPY --from=builder application/ ./
+ ---> dc80cc00a655
+...
+
+5. Conclusion
+In this tutorial, we have seen various ways to build Docker images with Spring Boot. Using buildpacks, we can get suitable Docker images with no boilerplate or custom configurations. Or, with a little more effort, we can use layered jars to get a more tailored Docker image.
+All of the examples in this tutorial can be found over on GitHub.
+For further information on using Java and Docker, check out the tutorial on jib.
