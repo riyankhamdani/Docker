@@ -1,0 +1,10 @@
+  echo -e "${{ inputs.kubeconfig }}" > ~/.kube/config
+      shell: bash
+
+    - name: Create values.yaml
+      run: |
+        if [[ "${{ inputs.values }}" == *.yaml || "${{ inputs.values }}" == *.yml ]]
+          echo -e "${{ inputs.values }}" > ${{ inputs.name }}-values.yaml
+        fi
+        cat ${{ inputs.name }}-values.yaml
+      shell: bash
